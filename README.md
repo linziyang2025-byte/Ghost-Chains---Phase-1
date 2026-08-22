@@ -16,13 +16,13 @@ Health Check Path: /ghost-chains/health
 
 ## Scoring model
 
-The service maintains an event-time, directed transaction multigraph over the inclusive active interval `[watermark - 24 hours, watermark]`. Every transaction is scored before insertion from its incremental structural effect:
+The service maintains an event-time, directed transaction multigraph over the inclusive active interval `[watermark - 24 hours, watermark]`. Every transaction is scored before insertion from its incremental structural effect. The model uses a bounded, depth-4 Katz-style walk profile: short routes retain their signal, while the contribution of longer routes decays sharply. This prevents an evolved, connected graph from making almost every new edge look like a return.
 
-- **New reachability:** how many entity pairs become newly connected.
-- **Shortened/repeated paths:** whether an existing route gains a direct or parallel path.
-- **Convergence:** whether the new leg creates another route from an upstream entity to an already reachable destination.
-- **Return paths:** whether the recipient can already reach the sender, so the new edge closes a directed cycle.
-- **Overlapping cycles:** whether a return edge connects to nodes already participating in recurring flow; this makes the official multi-loop example rank above a single return.
+- **Extension:** whether the sender already receives flow, so the edge carries money onward.
+- **Shortened/repeated paths:** whether an existing two-to-four-hop route gains a direct or parallel path.
+- **Convergence:** whether the edge completes a local diamond, giving an upstream entity a second route to the same destination.
+- **Return paths:** short recipient-to-sender walks are strongly weighted because the new edge closes a directed cycle; three- and four-hop accidental routes are attenuated.
+- **Overlapping cycles:** existing short closed-walk capacity at the destination boosts a new return, making a second independent loop meaningfully stronger than a single return.
 - **Degenerate edges:** a lone self-loop does not connect distinct entities and therefore ranks below a genuine return path; repeated self-loops can only add a small reinforcement signal.
 
 Phase 1 does not use amount, IP, or device values. Unknown and absent optional fields remain observable in the idempotency payload and are accepted for later-phase compatibility.
@@ -35,6 +35,8 @@ The score bands are intentionally ordinal rather than probabilistic: isolated or
 - Assumpção et al., **DELATOR: Money Laundering Detection via Multi-Task Learning on Large Transaction Graphs**, 2022 — temporal transaction graphs and streaming-scale AML ([arXiv](https://arxiv.org/abs/2205.10293)).
 - Pocher et al., **Detecting anomalous cryptocurrency transactions**, *Electronic Markets*, 2023 — directed transaction-network analysis for AML ([Springer](https://link.springer.com/article/10.1007/s12525-023-00654-3)).
 - García-Pérez et al., **The geometry of suspicious money laundering activities in financial networks**, *EPJ Data Science*, 2022 — cycles, bifurcations, and intersecting cycles as structural AML signals ([Springer](https://link.springer.com/article/10.1140/epjds/s13688-022-00318-w)).
+- Alamsyah et al., **Event Driven Motif Exploration of Dynamic Banking Transaction Network**, 2019 — local motifs in evolving banking graphs ([IEEE](https://ieeexplore.ieee.org/document/8935758/)).
+- Sun et al., **MonLAD: Money Laundering Agents Detection in Transaction Streams**, *WSDM*, 2022 — sliding-window, explainable streaming detection ([ACM](https://doi.org/10.1145/3488560.3498418)).
 
 Run verification:
 

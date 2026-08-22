@@ -105,7 +105,47 @@ class Phase1Tests(unittest.TestCase):
         two = final_score(
             [("A", "B"), ("A", "D"), ("B", "C"), ("D", "C"), ("C", "A")]
         )
-        self.assertGreater(two, one)
+        self.assertGreater(two, one + 0.10)
+
+    def test_remote_accidental_route_is_not_treated_as_a_short_return(self):
+        short_return = final_score([("A", "B"), ("B", "C"), ("C", "A")])
+        remote_return = final_score(
+            [
+                ("A", "X1"),
+                ("X1", "X2"),
+                ("X2", "X3"),
+                ("X3", "B"),
+                ("B", "A"),
+            ]
+        )
+        self.assertGreater(short_return, remote_return + 0.25)
+
+    def test_very_long_return_retains_a_small_recurrence_signal(self):
+        extension = final_score([("A", "B"), ("B", "C")])
+        long_return = final_score(
+            [
+                ("A", "X1"),
+                ("X1", "X2"),
+                ("X2", "X3"),
+                ("X3", "X4"),
+                ("X4", "B"),
+                ("B", "A"),
+            ]
+        )
+        self.assertGreater(long_return, extension)
+        self.assertLess(long_return, 0.40)
+
+    def test_dense_connectivity_does_not_saturate_every_score(self):
+        """Regression for the 376-point build's near-all-high-score failure."""
+        graph = RiskGraph()
+        scores = []
+        for i in range(60):
+            source = f"N{i % 12}"
+            target = f"N{(i * 5 + 3) % 17}"
+            if source == target:
+                target += "x"
+            scores.append(graph.score(tx(f"dense-{i}", source, target, i)))
+        self.assertLess(sum(score > 0.80 for score in scores), len(scores) // 2)
 
     def test_batch_is_processed_in_order(self):
         graph = RiskGraph()

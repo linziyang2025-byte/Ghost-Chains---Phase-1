@@ -18,8 +18,10 @@ from typing import Any
 
 WINDOW_SECONDS = 24 * 60 * 60
 MAX_GRAPH_VISITS = 20_000
-MAX_SIMPLE_PATHS = 16
-MODEL_VERSION = "phase1-evidence-v3"
+MAX_LOCAL_DEPTH = 4
+MAX_WALK_COUNT = 64
+LOCAL_PATH_DECAY = 0.40
+MODEL_VERSION = "phase1-local-motif-v4"
 TRACE_JSON = os.environ.get("TRACE_JSON", "1").lower() not in {"0", "false", "off", "no"}
 
 
@@ -140,94 +142,81 @@ class RiskGraph:
                     queue.append((nxt, distance + 1))
         return None
 
-    def _count_simple_paths(
-        self, start: str, target: str, max_paths: int = MAX_SIMPLE_PATHS
-    ) -> int:
-        """Count capped shortest simple paths, including parallel-edge capacity.
+    def _walk_profile(
+        self, start: str, target: str, max_depth: int = MAX_LOCAL_DEPTH
+    ) -> list[int]:
+        """Count bounded directed walks of each exact length.
 
-        Breadth-first dynamic programming avoids exponential path enumeration on
-        dense streaming graphs while still distinguishing independent return routes.
+        Phase 1 is about the *increment* caused by the incoming edge.  Counting
+        arbitrary reachability made an evolved graph look almost completely risky:
+        once the graph became connected, even a remote accidental route was treated
+        like a deliberate return.  A truncated Katz-style profile keeps the useful
+        short-path signal and discounts remote connectivity.  Counts and depth are
+        capped so work remains bounded on dense multigraphs.
         """
-        if start == target:
-            return 1
-        distance = {start: 0}
-        ways = {start: 1}
-        queue = deque([start])
-        target_distance: int | None = None
-        while queue and len(distance) < MAX_GRAPH_VISITS:
-            node = queue.popleft()
-            next_distance = distance[node] + 1
-            if target_distance is not None and next_distance > target_distance:
-                continue
-            for nxt, multiplicity in self.out.get(node, {}).items():
-                contribution = min(max_paths, ways[node] * multiplicity)
-                if nxt not in distance:
-                    distance[nxt] = next_distance
-                    ways[nxt] = contribution
-                    if nxt == target:
-                        target_distance = next_distance
-                    else:
-                        queue.append(nxt)
-                elif distance[nxt] == next_distance:
-                    ways[nxt] = min(max_paths, ways[nxt] + contribution)
-        return ways.get(target, 0)
+        profile = [0] * (max_depth + 1)
+        frontier: dict[str, int] = {start: 1}
+        for depth in range(1, max_depth + 1):
+            next_frontier: dict[str, int] = defaultdict(int)
+            for node, ways in frontier.items():
+                for nxt, multiplicity in self.out.get(node, {}).items():
+                    # A degenerate self-transfer must not manufacture many local
+                    # paths or turn an ordinary edge into an apparent multi-loop.
+                    if nxt == node:
+                        continue
+                    contribution = min(MAX_WALK_COUNT, ways * multiplicity)
+                    next_frontier[nxt] = min(
+                        MAX_WALK_COUNT, next_frontier[nxt] + contribution
+                    )
+            profile[depth] = next_frontier.get(target, 0)
+            frontier = next_frontier
+            if not frontier:
+                break
+        return profile
 
-    def _cycles_through(self, node: str) -> int:
-        """Capped count of non-degenerate cycle branches through the node."""
-        can_return = self._reachable(node, reverse=True)
-        total = 0
-        for nxt, multiplicity in self.out.get(node, {}).items():
-            if nxt == node or total >= MAX_SIMPLE_PATHS:
-                continue
-            if nxt in can_return:
-                total += min(MAX_SIMPLE_PATHS - total, multiplicity)
-        return total
+    @staticmethod
+    def _weighted_paths(profile: list[int], weights: dict[int, float]) -> float:
+        return sum(profile[depth] * weight for depth, weight in weights.items())
 
-    def _return_route_branches(self, start: str, target: str) -> int:
-        """Count distinct first-leg capacity on routes from start to target.
+    def _cycle_context(self, node: str) -> float:
+        """Short non-degenerate closed-walk capacity already touching ``node``."""
+        profile = self._walk_profile(node, node)
+        return sum(
+            profile[depth] * (LOCAL_PATH_DECAY ** (depth - 2))
+            for depth in range(2, MAX_LOCAL_DEPTH + 1)
+        )
 
-        Unlike shortest-path counting, this also recognizes independent return
-        routes with different lengths, while remaining linear in graph size.
+    def _diamond_routes(self, source: str, target: str) -> int:
+        """Count the local convergence motif created by ``source -> target``.
+
+        For P->source plus P->middle->target, the new edge gives P a second route
+        to target.  This is the exact structural relationship in the convergence
+        example and is far less vulnerable to unrelated long paths than intersecting
+        the transitive closure of the whole graph.
         """
-        if start == target:
-            return 0
-        can_reach_target = self._reachable(target, reverse=True)
         total = 0
-        for nxt, multiplicity in self.out.get(start, {}).items():
-            if nxt == start:
-                continue
-            if nxt == target or nxt in can_reach_target:
-                total += multiplicity
-                if total >= MAX_SIMPLE_PATHS:
-                    return MAX_SIMPLE_PATHS
+        for parent, parent_to_source in self.inn.get(source, {}).items():
+            for middle, parent_to_middle in self.out.get(parent, {}).items():
+                if middle == source:
+                    continue
+                middle_to_target = self.out.get(middle, {}).get(target, 0)
+                total += parent_to_source * parent_to_middle * middle_to_target
+                if total >= MAX_WALK_COUNT:
+                    return MAX_WALK_COUNT
         return total
-
-    def _path_impact(self, source: str, target: str) -> tuple[int, int, int]:
-        """Return (new pairs, convergent pairs, shortcut pairs) from source->target."""
-        ancestors = self._reachable(source, reverse=True)
-        target_ancestors = self._reachable(target, reverse=True)
-        descendants = self._reachable(target)
-        source_reachable = self._reachable(source)
-        # Common upstream entities already have a different route to the target;
-        # source->target therefore creates convergence rather than mere extension.
-        convergence_pairs = len((ancestors & target_ancestors) - {source})
-        shortcut_pairs = len(source_reachable & descendants)
-        potential_pairs = len(ancestors) * len(descendants)
-        new_pairs = max(0, potential_pairs - convergence_pairs - shortcut_pairs)
-        return new_pairs, convergence_pairs, shortcut_pairs
 
     def _structural_score(self, source: str, target: str) -> tuple[float, dict[str, Any]]:
         existing_parallel = self.out.get(source, {}).get(target, 0)
-        repetition = saturate(existing_parallel, 1.5)
+        repetition = saturate(existing_parallel, 1.0)
 
         # A self-transfer does not create or shorten a path between distinct
         # entities. It can reinforce an already recurrent component, but a lone
         # self-loop must rank far below a genuine multi-entity return path.
         if source == target:
-            surrounding_cycles = self._cycles_through(source)
+            surrounding_cycles = self._cycle_context(source)
             score = min(
-                0.30,
-                0.08 * repetition + 0.18 * saturate(surrounding_cycles, 1.0),
+                0.18,
+                0.05 * repetition + 0.10 * saturate(surrounding_cycles, 0.5),
             )
             return score, {
                 "classification": "degenerate_self_loop",
@@ -236,83 +225,88 @@ class RiskGraph:
                 "shortcutPairs": 0,
                 "existingParallelEdges": existing_parallel,
                 "returnPaths": 0,
-                "surroundingCycles": surrounding_cycles,
+                "surroundingCycleStrength": round(surrounding_cycles, 6),
                 "activeEdgesBefore": len(self.expiry_heap),
             }
 
-        new_pairs, convergence_pairs, shortcut_pairs = self._path_impact(source, target)
-        shortest_return_paths = self._count_simple_paths(target, source)
-        return_route_branches = self._return_route_branches(target, source)
-        return_paths = max(shortest_return_paths, return_route_branches)
-
-        novelty = saturate(max(0, new_pairs - 1), 3.0)
-        convergence = saturate(convergence_pairs, 2.0)
+        return_profile = self._walk_profile(target, source)
+        # A reciprocal or two-hop return is strong. Three- and four-hop routes are
+        # still evidence, but are aggressively attenuated because accidental long
+        # paths become common as a transaction graph grows.
+        return_strength = self._weighted_paths(
+            return_profile, {1: 1.15, 2: 1.0, 3: 0.35, 4: 0.12}
+        )
+        distant_return_distance: int | None = None
+        if return_strength == 0:
+            distant_return_distance = self._shortest_distance(target, source)
+            if distant_return_distance is not None:
+                # Preserve the principle that an arbitrarily long return is still
+                # more recurrent than a one-way extension, without allowing remote
+                # connectivity to dominate a dense graph.
+                return_strength = 0.08 * (
+                    0.5 ** max(0, distant_return_distance - MAX_LOCAL_DEPTH - 1)
+                )
+        diamond_routes = self._diamond_routes(source, target)
+        shortcut_profile = self._walk_profile(source, target)
+        shortcut_strength = self._weighted_paths(
+            shortcut_profile, {2: 1.0, 3: 0.35, 4: 0.12}
+        )
+        continuation_edges = sum(self.inn.get(source, {}).values())
+        branch_edges = sum(self.out.get(source, {}).values())
         features: dict[str, Any] = {
-            "newPairs": new_pairs,
-            "convergencePairs": convergence_pairs,
-            "shortcutPairs": shortcut_pairs,
             "existingParallelEdges": existing_parallel,
-            "returnPaths": return_paths,
-            "shortestReturnPaths": shortest_return_paths,
-            "returnRouteBranches": return_route_branches,
+            "returnWalksByDepth": return_profile[1:],
+            "returnStrength": round(return_strength, 6),
+            "distantReturnDistance": distant_return_distance,
+            "diamondRoutes": diamond_routes,
+            "shortcutWalksByDepth": shortcut_profile[1:],
+            "shortcutStrength": round(shortcut_strength, 6),
+            "continuationEdges": continuation_edges,
+            "branchEdges": branch_edges,
             "activeEdgesBefore": len(self.expiry_heap),
         }
 
-        if return_paths:
-            # Closing target->...->source creates a cycle. Existing cycles at either
-            # endpoint make the new cycle overlap with recurring flow, which is what
-            # distinguishes the official multi-loop example from a single return.
-            shared_cycles = self._cycles_through(source) + self._cycles_through(target)
-            cycle_routes = saturate(return_paths, 1.0)
-            overlap = saturate(shared_cycles, 1.0)
+        if return_strength > 0:
+            # This edge closes target->...->source->target. Existing short cycles at
+            # the destination mean it adds a second recurrent route into the same
+            # node: precisely the multi-loop distinction in the challenge.
+            cycle_context = self._cycle_context(target)
             score = (
-                0.58
-                + 0.22 * cycle_routes
-                + 0.14 * overlap
-                + 0.03 * convergence
-                + 0.02 * novelty
-                + 0.01 * repetition
+                0.26
+                + 0.62 * saturate(return_strength, 0.8)
+                + 0.22 * saturate(cycle_context, 0.5)
+                + 0.02 * repetition
             )
             features.update(
                 {
                     "classification": "return",
-                    "sharedCycles": shared_cycles,
-                    "cycleRouteSignal": round(cycle_routes, 6),
-                    "overlapSignal": round(overlap, 6),
+                    "destinationCycleContext": round(cycle_context, 6),
                 }
             )
             return min(1.0, score), features
 
-        prior_distance = self._shortest_distance(source, target)
-        shortcut = 0.0
-        if prior_distance is not None:
-            shortcut = saturate(
-                max(1, prior_distance - 1) + max(0, shortcut_pairs - 1), 1.5
+        if diamond_routes:
+            classification = "convergence"
+            score = 0.30 + 0.20 * saturate(diamond_routes, 1.0)
+        elif shortcut_strength > 0:
+            classification = "shortcut"
+            score = 0.20 + 0.12 * saturate(shortcut_strength, 1.0)
+        elif existing_parallel:
+            classification = "repeated_edge"
+            score = 0.15 + 0.06 * repetition
+        else:
+            classification = "extension" if continuation_edges else "ordinary"
+            score = (
+                0.11 * saturate(continuation_edges, 1.0)
+                + 0.035 * saturate(branch_edges, 1.0)
             )
-        fan_in = saturate(len(self.inn.get(target, {})), 1.5)
-        continuation = 1.0 if self.inn.get(source) else 0.0
-        branching = saturate(len(self.out.get(source, {})), 1.0)
 
-        score = (
-            0.10 * novelty
-            + 0.42 * convergence
-            + 0.18 * shortcut
-            + 0.12 * fan_in
-            + 0.05 * continuation
-            + 0.05 * branching
-            + 0.08 * repetition
-        )
-        # Any genuine return path should remain above acyclic patterns.
         features.update(
             {
-                "classification": "acyclic",
-                "priorDistance": prior_distance,
-                "fanIn": len(self.inn.get(target, {})),
-                "continuation": bool(self.inn.get(source)),
-                "branchOutDegree": len(self.out.get(source, {})),
+                "classification": classification,
             }
         )
-        return min(0.57, score), features
+        return min(0.52, score), features
 
     def score(self, tx: Any) -> float:
         txid, source, target, timestamp, digest = self._validate(tx)
