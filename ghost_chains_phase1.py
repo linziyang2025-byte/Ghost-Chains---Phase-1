@@ -19,6 +19,18 @@ from typing import Any
 WINDOW_SECONDS = 24 * 60 * 60
 MAX_GRAPH_VISITS = 20_000
 MAX_SIMPLE_PATHS = 16
+TRACE_JSON = os.environ.get("TRACE_JSON", "1").lower() not in {"0", "false", "off", "no"}
+
+
+def trace(event: str, **fields: Any) -> None:
+    """Emit one searchable JSON record to Render application logs."""
+    if not TRACE_JSON:
+        return
+    record = {"event": event, **fields}
+    print(
+        json.dumps(record, ensure_ascii=False, separators=(",", ":"), default=str),
+        flush=True,
+    )
 
 
 def parse_time(value: str) -> float:
@@ -183,7 +195,7 @@ class RiskGraph:
         new_pairs = max(0, potential_pairs - convergence_pairs - shortcut_pairs)
         return new_pairs, convergence_pairs, shortcut_pairs
 
-    def _structural_score(self, source: str, target: str) -> float:
+    def _structural_score(self, source: str, target: str) -> tuple[float, dict[str, Any]]:
         new_pairs, convergence_pairs, shortcut_pairs = self._path_impact(source, target)
         existing_parallel = self.out.get(source, {}).get(target, 0)
         return_paths = 1 if source == target else self._count_simple_paths(target, source)
@@ -191,6 +203,14 @@ class RiskGraph:
         novelty = saturate(max(0, new_pairs - 1), 3.0)
         convergence = saturate(convergence_pairs, 2.0)
         repetition = saturate(existing_parallel, 1.5)
+        features: dict[str, Any] = {
+            "newPairs": new_pairs,
+            "convergencePairs": convergence_pairs,
+            "shortcutPairs": shortcut_pairs,
+            "existingParallelEdges": existing_parallel,
+            "returnPaths": return_paths,
+            "activeEdgesBefore": len(self.expiry_heap),
+        }
 
         if return_paths:
             # Closing target->...->source creates a cycle. Existing cycles at either
@@ -209,7 +229,15 @@ class RiskGraph:
                 + 0.01 * repetition
                 + self_loop
             )
-            return min(1.0, score)
+            features.update(
+                {
+                    "classification": "return",
+                    "sharedCycles": shared_cycles,
+                    "cycleRouteSignal": round(cycle_routes, 6),
+                    "overlapSignal": round(overlap, 6),
+                }
+            )
+            return min(1.0, score), features
 
         prior_distance = self._shortest_distance(source, target)
         shortcut = 0.0
@@ -231,7 +259,16 @@ class RiskGraph:
             + 0.08 * repetition
         )
         # Any genuine return path should remain above acyclic patterns.
-        return min(0.57, score)
+        features.update(
+            {
+                "classification": "acyclic",
+                "priorDistance": prior_distance,
+                "fanIn": len(self.inn.get(target, {})),
+                "continuation": bool(self.inn.get(source)),
+                "branchOutDegree": len(self.out.get(source, {})),
+            }
+        )
+        return min(0.57, score), features
 
     def score(self, tx: Any) -> float:
         txid, source, target, timestamp, digest = self._validate(tx)
@@ -241,6 +278,14 @@ class RiskGraph:
                 old_digest, old_score = duplicate
                 if old_digest != digest:
                     raise ValueError("txId was reused with a different payload")
+                trace(
+                    "tx_score",
+                    tx=tx,
+                    riskScore=old_score,
+                    duplicate=True,
+                    watermark=self.watermark,
+                    activeEdges=len(self.expiry_heap),
+                )
                 return old_score
 
             self.watermark = timestamp if self.watermark is None else max(self.watermark, timestamp)
@@ -250,8 +295,14 @@ class RiskGraph:
             # A late event outside the active interval cannot change current state.
             if timestamp <= cutoff:
                 score = 0.0
+                features: dict[str, Any] = {
+                    "classification": "late_expired",
+                    "timestamp": timestamp,
+                    "cutoff": cutoff,
+                }
             else:
-                score = round(max(0.0, min(1.0, self._structural_score(source, target))), 6)
+                raw_score, features = self._structural_score(source, target)
+                score = round(max(0.0, min(1.0, raw_score)), 6)
                 self.sequence += 1
                 heapq.heappush(
                     self.expiry_heap, (timestamp, self.sequence, source, target)
@@ -260,6 +311,16 @@ class RiskGraph:
                 self.inn[target][source] += 1
 
             self.seen[txid] = (digest, score)
+            trace(
+                "tx_score",
+                tx=tx,
+                riskScore=score,
+                duplicate=False,
+                watermark=self.watermark,
+                cutoff=cutoff,
+                features=features,
+                activeEdgesAfter=len(self.expiry_heap),
+            )
             return score
 
     def process_batch(self, transactions: list[Any]) -> list[dict[str, Any]]:
@@ -296,25 +357,38 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            body = json.loads(self.rfile.read(length) or b"{}")
+            raw_body = self.rfile.read(length)
+            body = json.loads(raw_body or b"{}")
             if not isinstance(body, dict):
                 raise ValueError("request body must be a JSON object")
             path = self.path.split("?", 1)[0]
+            trace(
+                "http_request",
+                method="POST",
+                path=path,
+                contentLength=length,
+                body=body,
+            )
             if path == "/ghost-chains/reset":
                 if body.get("clearTransactions") is not True:
                     raise ValueError("clearTransactions must be true")
                 with graph.lock:
                     graph.reset()
-                self._send(200, {"clearTransactions": True})
+                response = {"clearTransactions": True}
+                trace("state_reset", response=response)
+                self._send(200, response)
                 return
             if path == "/ghost-chains/transactions":
                 transactions = body.get("transactions")
                 if not isinstance(transactions, list):
                     raise ValueError("transactions must be an array")
-                self._send(200, {"transactions": graph.process_batch(transactions)})
+                response = {"transactions": graph.process_batch(transactions)}
+                trace("http_response", path=path, status=200, body=response)
+                self._send(200, response)
                 return
             self._send(404, {"error": "not found"})
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            trace("http_error", path=self.path, status=400, error=str(exc))
             self._send(400, {"error": str(exc)})
 
     def log_message(self, *_: Any) -> None:
