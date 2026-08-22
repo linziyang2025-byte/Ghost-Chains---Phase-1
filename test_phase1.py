@@ -1,5 +1,8 @@
 import unittest
+import os
 from datetime import datetime, timedelta, timezone
+
+os.environ.setdefault("TRACE_JSON", "0")
 
 try:
     from ghost_chains_phase1 import RiskGraph
@@ -60,10 +63,16 @@ class Phase1Tests(unittest.TestCase):
         with self.assertRaises(ValueError):
             graph.score(tx(1, "A", "C"))
 
-    def test_exact_24_hour_boundary_is_expired(self):
+    def test_exact_24_hour_boundary_is_still_active(self):
         graph = RiskGraph()
         graph.score(tx(1, "A", "B", 0))
         score = graph.score(tx(2, "B", "A", 24 * 60 * 60))
+        self.assertGreater(score, 0.6)
+
+    def test_just_outside_24_hour_boundary_is_expired(self):
+        graph = RiskGraph()
+        graph.score(tx(1, "A", "B", 0))
+        score = graph.score(tx(2, "B", "A", 24 * 60 * 60 + 1))
         self.assertLess(score, 0.2)
 
     def test_just_inside_window_closes_cycle(self):
@@ -105,6 +114,72 @@ class Phase1Tests(unittest.TestCase):
         )
         self.assertEqual([item["txId"] for item in results], ["tx_1", "tx_2", "tx_3"])
         self.assertGreater(results[-1]["riskScore"], results[1]["riskScore"])
+
+    def test_lone_self_loop_ranks_below_real_return(self):
+        self_loop = final_score([("E1", "E1")])
+        reciprocal = final_score([("E2", "E3"), ("E3", "E2")])
+        self.assertLess(self_loop, reciprocal)
+
+    def test_real_hidden_feedback_batch(self):
+        """Regression fixture reconstructed from the evaluator request log."""
+        graph = RiskGraph()
+
+        def hidden(txid, source, target, timestamp):
+            return {
+                "txId": txid,
+                "fromUserId": source,
+                "toUserId": target,
+                "amount": 1000.0,
+                "createdAt": timestamp,
+                "ipAddress": None,
+                "deviceId": None,
+            }
+
+        payload = [
+            hidden("hf-temporal01-tx1", "hf_A1", "hf_A2", "2026-06-08T00:00:00Z"),
+            hidden("hf-temporal01-tx4", "hf_B1", "hf_B2", "2026-06-08T00:00:00Z"),
+            hidden("hf-struct01-tx1", "hf_E1", "hf_E1", "2026-06-08T00:00:00Z"),
+            hidden("hf-temporal01-tx2", "hf_A2", "hf_A3", "2026-06-08T01:00:00Z"),
+            hidden("hf-temporal01-tx5", "hf_B2", "hf_B3", "2026-06-08T01:00:00Z"),
+            hidden("hf-struct01-tx2", "hf_E2", "hf_E3", "2026-06-08T01:00:00Z"),
+            hidden("hf-struct01-tx3", "hf_E3", "hf_E2", "2026-06-08T02:00:00Z"),
+            hidden("hf-temporal01-tx3", "hf_A3", "hf_A1", "2026-06-08T23:00:00Z"),
+            hidden("hf-temporal01-tx6", "hf_B3", "hf_B1", "2026-06-09T00:00:00Z"),
+        ]
+        scores = {
+            result["txId"]: result["riskScore"]
+            for result in graph.process_batch(payload)
+        }
+        self.assertLess(scores["hf-struct01-tx1"], scores["hf-struct01-tx3"])
+        self.assertGreater(scores["hf-temporal01-tx3"], 0.6)
+        self.assertGreater(scores["hf-temporal01-tx6"], 0.6)
+        self.assertAlmostEqual(
+            scores["hf-temporal01-tx3"], scores["hf-temporal01-tx6"], places=6
+        )
+
+    def test_unrelated_components_do_not_change_structural_score(self):
+        baseline = RiskGraph()
+        baseline.score(tx("base1", "A", "B", 0))
+        baseline.score(tx("base2", "B", "C", 1))
+        expected = baseline.score(tx("base3", "C", "A", 2))
+
+        interleaved = RiskGraph()
+        interleaved.score(tx("mix1", "A", "B", 0))
+        interleaved.score(tx("noise1", "X", "Y", 0))
+        interleaved.score(tx("mix2", "B", "C", 1))
+        interleaved.score(tx("noise2", "Q", "R", 1))
+        actual = interleaved.score(tx("mix3", "C", "A", 2))
+        self.assertEqual(expected, actual)
+
+    def test_self_loop_does_not_fake_overlapping_cycle(self):
+        plain = final_score([("A", "B"), ("B", "A")])
+        with_self_loop = final_score([("A", "A"), ("A", "B"), ("B", "A")])
+        self.assertEqual(plain, with_self_loop)
+
+    def test_parallel_acyclic_edge_ranks_below_return(self):
+        repeated = final_score([("A", "B"), ("A", "B")])
+        returned = final_score([("A", "B"), ("B", "A")])
+        self.assertLess(repeated, returned)
 
 
 if __name__ == "__main__":

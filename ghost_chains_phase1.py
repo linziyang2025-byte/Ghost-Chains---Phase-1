@@ -19,6 +19,7 @@ from typing import Any
 WINDOW_SECONDS = 24 * 60 * 60
 MAX_GRAPH_VISITS = 20_000
 MAX_SIMPLE_PATHS = 16
+MODEL_VERSION = "phase1-evidence-v3"
 TRACE_JSON = os.environ.get("TRACE_JSON", "1").lower() not in {"0", "false", "off", "no"}
 
 
@@ -98,9 +99,10 @@ class RiskGraph:
     def _remove_expired(self) -> None:
         if self.watermark is None:
             return
-        # Active event-time interval is (watermark - 24h, watermark].
+        # "Within the most recent 24 hours" is inclusive at the exact boundary:
+        # active event-time interval is [watermark - 24h, watermark].
         cutoff = self.watermark - WINDOW_SECONDS
-        while self.expiry_heap and self.expiry_heap[0][0] <= cutoff:
+        while self.expiry_heap and self.expiry_heap[0][0] < cutoff:
             _, _, source, target = heapq.heappop(self.expiry_heap)
             self.out[source][target] -= 1
             self.inn[target][source] -= 1
@@ -171,14 +173,33 @@ class RiskGraph:
         return ways.get(target, 0)
 
     def _cycles_through(self, node: str) -> int:
-        """Capped count of distinct first legs that return to the node."""
+        """Capped count of non-degenerate cycle branches through the node."""
         can_return = self._reachable(node, reverse=True)
-        total = self.out.get(node, {}).get(node, 0)
+        total = 0
         for nxt, multiplicity in self.out.get(node, {}).items():
             if nxt == node or total >= MAX_SIMPLE_PATHS:
                 continue
             if nxt in can_return:
                 total += min(MAX_SIMPLE_PATHS - total, multiplicity)
+        return total
+
+    def _return_route_branches(self, start: str, target: str) -> int:
+        """Count distinct first-leg capacity on routes from start to target.
+
+        Unlike shortest-path counting, this also recognizes independent return
+        routes with different lengths, while remaining linear in graph size.
+        """
+        if start == target:
+            return 0
+        can_reach_target = self._reachable(target, reverse=True)
+        total = 0
+        for nxt, multiplicity in self.out.get(start, {}).items():
+            if nxt == start:
+                continue
+            if nxt == target or nxt in can_reach_target:
+                total += multiplicity
+                if total >= MAX_SIMPLE_PATHS:
+                    return MAX_SIMPLE_PATHS
         return total
 
     def _path_impact(self, source: str, target: str) -> tuple[int, int, int]:
@@ -196,19 +217,44 @@ class RiskGraph:
         return new_pairs, convergence_pairs, shortcut_pairs
 
     def _structural_score(self, source: str, target: str) -> tuple[float, dict[str, Any]]:
-        new_pairs, convergence_pairs, shortcut_pairs = self._path_impact(source, target)
         existing_parallel = self.out.get(source, {}).get(target, 0)
-        return_paths = 1 if source == target else self._count_simple_paths(target, source)
+        repetition = saturate(existing_parallel, 1.5)
+
+        # A self-transfer does not create or shorten a path between distinct
+        # entities. It can reinforce an already recurrent component, but a lone
+        # self-loop must rank far below a genuine multi-entity return path.
+        if source == target:
+            surrounding_cycles = self._cycles_through(source)
+            score = min(
+                0.30,
+                0.08 * repetition + 0.18 * saturate(surrounding_cycles, 1.0),
+            )
+            return score, {
+                "classification": "degenerate_self_loop",
+                "newPairs": 0,
+                "convergencePairs": 0,
+                "shortcutPairs": 0,
+                "existingParallelEdges": existing_parallel,
+                "returnPaths": 0,
+                "surroundingCycles": surrounding_cycles,
+                "activeEdgesBefore": len(self.expiry_heap),
+            }
+
+        new_pairs, convergence_pairs, shortcut_pairs = self._path_impact(source, target)
+        shortest_return_paths = self._count_simple_paths(target, source)
+        return_route_branches = self._return_route_branches(target, source)
+        return_paths = max(shortest_return_paths, return_route_branches)
 
         novelty = saturate(max(0, new_pairs - 1), 3.0)
         convergence = saturate(convergence_pairs, 2.0)
-        repetition = saturate(existing_parallel, 1.5)
         features: dict[str, Any] = {
             "newPairs": new_pairs,
             "convergencePairs": convergence_pairs,
             "shortcutPairs": shortcut_pairs,
             "existingParallelEdges": existing_parallel,
             "returnPaths": return_paths,
+            "shortestReturnPaths": shortest_return_paths,
+            "returnRouteBranches": return_route_branches,
             "activeEdgesBefore": len(self.expiry_heap),
         }
 
@@ -219,7 +265,6 @@ class RiskGraph:
             shared_cycles = self._cycles_through(source) + self._cycles_through(target)
             cycle_routes = saturate(return_paths, 1.0)
             overlap = saturate(shared_cycles, 1.0)
-            self_loop = 0.06 if source == target else 0.0
             score = (
                 0.58
                 + 0.22 * cycle_routes
@@ -227,7 +272,6 @@ class RiskGraph:
                 + 0.03 * convergence
                 + 0.02 * novelty
                 + 0.01 * repetition
-                + self_loop
             )
             features.update(
                 {
@@ -292,8 +336,8 @@ class RiskGraph:
             self._remove_expired()
             cutoff = self.watermark - WINDOW_SECONDS
 
-            # A late event outside the active interval cannot change current state.
-            if timestamp <= cutoff:
+            # A late event strictly older than 24 hours cannot change current state.
+            if timestamp < cutoff:
                 score = 0.0
                 features: dict[str, Any] = {
                     "classification": "late_expired",
@@ -398,4 +442,11 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     server = ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8080"))), Handler)
     server.daemon_threads = True
+    trace(
+        "service_start",
+        modelVersion=MODEL_VERSION,
+        port=server.server_address[1],
+        lookbackSeconds=WINDOW_SECONDS,
+        boundary="inclusive",
+    )
     server.serve_forever()

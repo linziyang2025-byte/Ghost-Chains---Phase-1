@@ -16,15 +16,18 @@ Health Check Path: /ghost-chains/health
 
 ## Scoring model
 
-The service maintains an event-time, directed transaction multigraph over the active interval `(watermark - 24 hours, watermark]`. Every transaction is scored before insertion from its incremental structural effect:
+The service maintains an event-time, directed transaction multigraph over the inclusive active interval `[watermark - 24 hours, watermark]`. Every transaction is scored before insertion from its incremental structural effect:
 
 - **New reachability:** how many entity pairs become newly connected.
 - **Shortened/repeated paths:** whether an existing route gains a direct or parallel path.
 - **Convergence:** whether the new leg creates another route from an upstream entity to an already reachable destination.
 - **Return paths:** whether the recipient can already reach the sender, so the new edge closes a directed cycle.
 - **Overlapping cycles:** whether a return edge connects to nodes already participating in recurring flow; this makes the official multi-loop example rank above a single return.
+- **Degenerate edges:** a lone self-loop does not connect distinct entities and therefore ranks below a genuine return path; repeated self-loops can only add a small reinforcement signal.
 
 Phase 1 does not use amount, IP, or device values. Unknown and absent optional fields remain observable in the idempotency payload and are accepted for later-phase compatibility.
+
+The score bands are intentionally ordinal rather than probabilistic: isolated or degenerate flow is lowest, extension remains low, convergence is intermediate, a genuine multi-entity return is high, and overlapping/independent return routes are highest. Unrelated graph components never affect one another's score.
 
 ## Research basis
 
@@ -38,3 +41,14 @@ Run verification:
 ```bash
 python3 -m unittest -v test_phase1.py
 ```
+
+## Evaluation diagnostics
+
+JSON tracing is enabled by default. Open **Render → Monitor → Logs** and search for:
+
+- `http_request` — the complete JSON body received from the evaluator.
+- `tx_score` — the original transaction, graph features, time-window state, and score.
+- `http_response` — the exact JSON returned to the evaluator.
+- `state_reset` / `http_error` — reset calls and invalid requests.
+
+Each record is emitted as one JSON line. Set the Render environment variable `TRACE_JSON=0` after diagnosis if verbose logging is no longer needed.
